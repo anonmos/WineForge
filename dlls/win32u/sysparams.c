@@ -2830,7 +2830,12 @@ static UINT update_display_devices( struct device_manager_ctx *ctx )
     }
 
     if (status == STATUS_NOT_IMPLEMENTED) return default_update_display_devices( ctx );
-    return status;
+
+    /* Some macOS releases can fail display enumeration transiently or return
+     * an unusable configuration.  Do not spin forever in lock_display_devices
+     * in that case: expose Wine's safe virtual display instead. */
+    WARN( "display provider failed with status %#x, using the default virtual display\n", status );
+    return default_update_display_devices( ctx );
 }
 
 static void commit_display_devices( struct device_manager_ctx *ctx )
@@ -2889,8 +2894,27 @@ static BOOL lock_display_devices( BOOL force )
 
     pthread_mutex_lock( &display_lock );
 
+    /* macOS Tahoe can leave the native display provider unusable.  For
+     * headless/compatibility experiments, provide Wine's deterministic
+     * virtual monitor and skip the provider/cache path entirely. */
+    if (getenv( "WINE_FORCE_VIRTUAL_DISPLAY" ))
+    {
+        /* Keep the in-process virtual display stable.  Rebuilding the global
+         * source/monitor lists on every query races with Steam's helper
+         * threads and can leave add_modes() without a source. */
+        if (list_empty( &monitors ))
+        {
+            default_update_display_devices( &ctx );
+            commit_display_devices( &ctx );
+        }
+        release_display_manager_ctx( &ctx );
+        pthread_mutex_unlock( &display_lock );
+        return !list_empty( &monitors );
+    }
+
     serial = get_monitor_update_serial();
-    if (!force && monitor_update_serial >= serial) return TRUE;
+    /* A zero serial with an empty cache is not a valid initialized state. */
+    if (!force && monitor_update_serial >= serial && !list_empty( &monitors )) return TRUE;
 
     /* services do not have any adapters, only a virtual monitor */
     if (NtUserGetObjectInformation( NtUserGetProcessWindowStation(), UOI_NAME, name, sizeof(name), NULL )
@@ -2909,6 +2933,17 @@ static BOOL lock_display_devices( BOOL force )
         if (!get_opengl_gpus( &ctx.opengl_gpus )) WARN( "Failed to find any OpenGL GPU\n" );
         if (!(status = update_display_devices( &ctx ))) commit_display_devices( &ctx );
         else WARN( "Failed to update display devices, status %#x\n", status );
+
+        /* If the macOS display provider returned no usable monitor, rebuild
+         * the cache with Wine's deterministic single virtual display.  This
+         * is needed by applications that enumerate monitors before creating
+         * their first window. */
+        if (list_empty( &monitors ))
+        {
+            clear_display_devices();
+            default_update_display_devices( &ctx );
+            commit_display_devices( &ctx );
+        }
         release_display_manager_ctx( &ctx );
 
         ret = update_display_cache_from_registry( serial );
@@ -2917,6 +2952,9 @@ static BOOL lock_display_devices( BOOL force )
     if (!ret)
     {
         ERR( "Failed to read display config.\n" );
+        /* The in-memory fallback above is still valid even when the registry
+         * could not be refreshed on this macOS release. */
+        ret = !list_empty( &monitors );
         pthread_mutex_unlock( &display_lock );
     }
     return ret;

@@ -1496,7 +1496,11 @@ static void send_server_task_port(void)
     }
     kret = bootstrap_look_up(bootstrap_port, server_dir, &wineserver_port);
     if (kret != KERN_SUCCESS)
-        fatal_error( "cannot find the server port: 0x%08x\n", kret );
+    {
+        /* Mach tracing is optional; recent macOS versions may reject the
+         * server registration while the Unix server socket remains usable. */
+        return;
+    }
 
     mach_port_deallocate(mach_task_self(), bootstrap_port);
 

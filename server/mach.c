@@ -109,7 +109,13 @@ void init_tracing_mechanism(void)
                                  MACH_MSG_TYPE_MAKE_SEND ) != KERN_SUCCESS)
             fatal_error( "Error inserting rights\n" );
     if (bootstrap_register2( bp, server_dir, server_mach_port, 0 ) != KERN_SUCCESS)
-        fatal_error( "Can't check in server_mach_port\n" );
+    {
+        /* Recent macOS versions can reject the optional tracing port.  The
+         * Unix server socket remains usable without Mach tracing. */
+        fprintf( stderr, "warning: can't check in server_mach_port; disabling Mach tracing\n" );
+        mach_port_destroy( mach_task_self(), server_mach_port );
+        server_mach_port = MACH_PORT_NULL;
+    }
     mach_port_deallocate( mach_task_self(), bp );
 }
 
@@ -123,7 +129,9 @@ void init_process_tracing( struct process *process )
         mach_msg_body_t             body;
         mach_msg_port_descriptor_t  task_port;
         mach_msg_trailer_t          trailer; /* only present on receive */
-    } msg;
+        } msg;
+
+    if (server_mach_port == MACH_PORT_NULL) return;
 
     for (;;)
     {

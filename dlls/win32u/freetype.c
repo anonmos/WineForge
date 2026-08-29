@@ -1235,7 +1235,8 @@ static void fontconfig_add_font( FcPattern *pattern, UINT flags )
 
 static void init_fontconfig(void)
 {
-    void *fc_handle = dlopen(SONAME_LIBFONTCONFIG, RTLD_NOW);
+    const char *path = getenv( "WINE_FONTCONFIG_PATH" );
+    void *fc_handle = dlopen( path && *path ? path : SONAME_LIBFONTCONFIG, RTLD_NOW );
 
     if (!fc_handle)
     {
@@ -1454,7 +1455,8 @@ static void load_mac_fonts(void)
 
 static BOOL init_freetype(void)
 {
-    ft_handle = dlopen(SONAME_LIBFREETYPE, RTLD_NOW);
+    const char *path = getenv( "WINE_FREETYPE_PATH" );
+    ft_handle = dlopen( path && *path ? path : SONAME_LIBFREETYPE, RTLD_NOW );
     if(!ft_handle) {
         WINE_MESSAGE(
       "Wine cannot find the FreeType font library.  To enable Wine to\n"
