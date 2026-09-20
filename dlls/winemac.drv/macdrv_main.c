@@ -429,8 +429,6 @@ static void load_strings(struct localized_string *str)
 static NTSTATUS macdrv_init(void *arg)
 {
     struct init_params *params = arg;
-    SessionAttributeBits attributes;
-    OSStatus status;
 
     app_icon_callback = params->app_icon_callback;
     app_quit_request_callback = params->app_quit_request_callback;
@@ -438,9 +436,12 @@ static NTSTATUS macdrv_init(void *arg)
     regqueryvalueexa_callback = params->regqueryvalueexa_callback;
     regsetvalueexa_callback = params->regsetvalueexa_callback;
 
-    status = SessionGetInfo(callerSecuritySession, NULL, &attributes);
-    if (status != noErr || !(attributes & sessionHasGraphicAccess))
-        return STATUS_UNSUCCESSFUL;
+    /* NOTE: the historical SessionGetInfo/sessionHasGraphicAccess gate was
+     * removed on 2026-09-20: on macOS 27 it misfires for normal local Aqua
+     * launches (call fails outright, or succeeds with e.g. attrs=0x5020 and
+     * no graphic-access bit), unloading winemac and leaving nodrv behind.
+     * A genuinely headless session still fails below in
+     * macdrv_start_cocoa_app with a clear message. */
 
     pthread_key_create( &macdrv_thread_data_key, NULL );
 
