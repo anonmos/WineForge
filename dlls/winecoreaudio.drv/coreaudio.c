@@ -105,6 +105,7 @@ struct coreaudio_stream
     BOOL loopback;
     UINT64 loopback_seq;
     UINT64 loopback_consumed;
+    UINT64 loopback_last_ns;
     BYTE *loopback_snap;
     size_t loopback_snap_size;
 };
@@ -498,9 +499,7 @@ static void loopback_pump(struct coreaudio_stream *stream)
     UINT32 align = stream->fmt->nBlockAlign;
     struct timespec now;
     size_t need;
-    FILE *f;
-
-    if (!path || !*path) path = "/private/tmp/wine-sck-probe/audio.wsaf";
+    FILE *f;    if (!path || !*path) path = "/private/tmp/wine-sck-probe/audio.wsaf";
     if (!(f = fopen(path, "rb"))) return;
     if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr) ||
         memcmp(hdr, "WSAF", 4) || wsaf_le32(hdr + 4) != 1) {
@@ -540,6 +539,26 @@ static void loopback_pump(struct coreaudio_stream *stream)
         return;
     }
     fresh = frames - (UINT32)skip;
+    /* Meter bursty snapshots out at realtime pace. Dumping a whole
+     * snapshot at once makes the capture position jump backward by up
+     * to the window size, which Steam reports as audio gaps (and plays
+     * as choppy stutter). Unfed leftovers stay unconsumed for the next
+     * overlapping snapshot. */
+    {
+        struct timespec pt;
+        UINT64 pnow, elapsed, due;
+        clock_gettime(CLOCK_MONOTONIC, &pt);
+        pnow = (UINT64)pt.tv_sec * 1000000000ULL + pt.tv_nsec;
+        elapsed = pnow > stream->loopback_last_ns ? pnow - stream->loopback_last_ns : 0;
+        stream->loopback_last_ns = pnow;
+        due = elapsed * LOOPBACK_RATE / 1000000000ULL + stream->period_frames;
+        if (due > stream->bufsize_frames / 4) due = stream->bufsize_frames / 4;
+        if ((UINT64)fresh > due) fresh = (UINT32)due;
+        if (!fresh) {
+            fclose(f);
+            return;
+        }
+    }
     need = (size_t)fresh * align;
     if (need > stream->loopback_snap_size) {
         free(stream->loopback_snap);
@@ -567,7 +586,7 @@ static void loopback_pump(struct coreaudio_stream *stream)
         stream->held_frames = stream->bufsize_frames;
     } else
         stream->held_frames += (UINT32)fresh;
-    stream->loopback_consumed = first_frame + frames;
+    stream->loopback_consumed = first_frame + skip + fresh;
 }
 
 static NTSTATUS unix_get_loopback_capture_device(void *args)
@@ -1001,6 +1020,11 @@ static NTSTATUS unix_create_stream(void *args)
             goto end;
         }
         silence_buffer(stream, stream->local_buffer, stream->bufsize_frames);
+        {
+            struct timespec it;
+            clock_gettime(CLOCK_MONOTONIC, &it);
+            stream->loopback_last_ns = (UINT64)it.tv_sec * 1000000000ULL + it.tv_nsec;
+        }
         params->result = S_OK;
         goto end;
     }
