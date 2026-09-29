@@ -109,6 +109,7 @@ struct coreaudio_stream
     UINT64 loopback_first;
     UINT32 loopback_frames;
     UINT64 loopback_snap_ts;
+    UINT64 *loopback_ts;
     BYTE *loopback_snap;
     size_t loopback_snap_size;
 };
@@ -511,11 +512,68 @@ static void loopback_feed_silence(struct coreaudio_stream *stream, UINT32 frames
 {
     UINT32 align = stream->fmt->nBlockAlign;
     UINT32 first = stream->bufsize_frames - stream->wri_offs_frames;
+    LARGE_INTEGER stamp, freq;
+    UINT64 base, i, offs;
     if (first > frames) first = frames;
     silence_buffer(stream, stream->local_buffer + stream->wri_offs_frames * align, first);
     if (frames > first)
         silence_buffer(stream, stream->local_buffer, frames - first);
+    /* Generated now: stamp in QPC units so A/V sync stays honest. */
+    NtQueryPerformanceCounter(&stamp, &freq);
+    base = (UINT64)((stamp.QuadPart * (INT64)10000000) / freq.QuadPart);
+    offs = stream->wri_offs_frames;
+    for (i = 0; i < frames; i++) {
+        stream->loopback_ts[offs] = base + (i * 10000000ULL) / LOOPBACK_RATE;
+        if (++offs >= stream->bufsize_frames) offs = 0;
+    }
     loopback_commit(stream, frames);
+}
+
+/* Stamped copy of helper-captured frames; base_qpc is the QPC time
+ * (100ns units) of src[0], advancing at the stream rate. */
+static void loopback_feed_data(struct coreaudio_stream *stream, const BYTE *src,
+                               UINT32 frames, UINT64 base_qpc)
+{
+    UINT32 align = stream->fmt->nBlockAlign;
+    UINT32 first = stream->bufsize_frames - stream->wri_offs_frames;
+    UINT32 offs = stream->wri_offs_frames;
+    UINT64 i;
+    if (first > frames) first = frames;
+    memcpy(stream->local_buffer + offs * align, src, (size_t)first * align);
+    for (i = 0; i < first; i++) {
+        stream->loopback_ts[offs] = base_qpc + (i * 10000000ULL) / LOOPBACK_RATE;
+        if (++offs >= stream->bufsize_frames) offs = 0;
+    }
+    if (frames > first) {
+        memcpy(stream->local_buffer, src + (size_t)first * align,
+               (size_t)(frames - first) * align);
+        for (; i < frames; i++) {
+            stream->loopback_ts[offs] = base_qpc + (i * 10000000ULL) / LOOPBACK_RATE;
+            if (++offs >= stream->bufsize_frames) offs = 0;
+        }
+    }
+    loopback_commit(stream, frames);
+}
+
+/* QPC (100ns) timestamp for a snapshot frame: snapshot ts covers the
+ * window end, so frame k sits (frames - k) samples before it, shifted
+ * into the QPC epoch via a fresh anchor pair. */
+static UINT64 loopback_snapshot_qpc(UINT64 snap_unix_ns, UINT64 first_frame,
+                                    UINT64 frame_no, UINT32 window_frames)
+{
+    LARGE_INTEGER stamp, freq;
+    UINT64 unix_now, t_ns;
+    INT64 qpc_now, anchor;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    unix_now = (UINT64)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    NtQueryPerformanceCounter(&stamp, &freq);
+    qpc_now = (stamp.QuadPart * (INT64)10000000) / freq.QuadPart;
+    anchor = qpc_now - (INT64)(unix_now / 100);
+    if (frame_no < first_frame) frame_no = first_frame;
+    if (frame_no - first_frame > window_frames) return (UINT64)qpc_now;
+    t_ns = snap_unix_ns - ((UINT64)(window_frames - (frame_no - first_frame)) * 1000000000ULL) / LOOPBACK_RATE;
+    return (UINT64)((INT64)(t_ns / 100) + anchor);
 }
 
 static void loopback_pump(struct coreaudio_stream *stream, int timer)
@@ -594,12 +652,13 @@ static void loopback_pump(struct coreaudio_stream *stream, int timer)
         fresh = stream->loopback_frames - (UINT32)skip;
         if ((UINT64)fresh > allow) fresh = (UINT32)allow;
         if (!fresh) return;
-        ca_wrap_buffer(stream->local_buffer,
-                       stream->wri_offs_frames * align,
-                       stream->bufsize_frames * align,
-                       stream->loopback_snap + (size_t)skip * align,
-                       (size_t)fresh * align);
-        loopback_commit(stream, (UINT32)fresh);
+        loopback_feed_data(stream,
+                           stream->loopback_snap + (size_t)skip * align,
+                           (UINT32)fresh,
+                           loopback_snapshot_qpc(stream->loopback_snap_ts,
+                                                 stream->loopback_first,
+                                                 stream->loopback_consumed,
+                                                 stream->loopback_frames));
         stream->loopback_consumed += fresh;
         return;
     }
@@ -644,12 +703,11 @@ static void loopback_pump(struct coreaudio_stream *stream, int timer)
     stream->loopback_first = first_frame;
     stream->loopback_frames = frames;
     stream->loopback_snap_ts = timestamp_ns;
-    ca_wrap_buffer(stream->local_buffer,
-                   stream->wri_offs_frames * align,
-                   stream->bufsize_frames * align,
-                   stream->loopback_snap + (size_t)skip * align,
-                   (size_t)fresh * align);
-    loopback_commit(stream, (UINT32)fresh);
+    loopback_feed_data(stream,
+                       stream->loopback_snap + (size_t)skip * align,
+                       (UINT32)fresh,
+                       loopback_snapshot_qpc(timestamp_ns, first_frame,
+                                             first_frame + skip, frames));
     stream->loopback_consumed = first_frame + skip + fresh;
 }
 
@@ -1084,6 +1142,15 @@ static NTSTATUS unix_create_stream(void *args)
             goto end;
         }
         silence_buffer(stream, stream->local_buffer, stream->bufsize_frames);
+        stream->loopback_ts = calloc(stream->bufsize_frames, sizeof(UINT64));
+        if (!stream->loopback_ts) {
+            size = 0;
+            NtFreeVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer,
+                                &size, MEM_RELEASE);
+            stream->local_buffer = NULL;
+            params->result = E_OUTOFMEMORY;
+            goto end;
+        }
         {
             struct timespec it;
             clock_gettime(CLOCK_MONOTONIC, &it);
@@ -1208,6 +1275,7 @@ static NTSTATUS unix_release_stream( void *args )
     free(stream->wrap_buffer);
     free(stream->cap_buffer);
     free(stream->loopback_snap);
+    free(stream->loopback_ts);
     if(stream->local_buffer){
         size = 0;
         NtFreeVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer,
@@ -2023,9 +2091,16 @@ static NTSTATUS unix_get_capture_buffer(void *args)
 
     if(params->devpos)
         *params->devpos = stream->written_frames;
-    if(params->qpcpos){ /* fixme: qpc of recording time */
-        NtQueryPerformanceCounter(&stamp, &freq);
-        *params->qpcpos = (stamp.QuadPart * (INT64)10000000) / freq.QuadPart;
+    if(params->qpcpos){
+        if (stream->loopback && stream->loopback_ts &&
+            stream->loopback_ts[stream->lcl_offs_frames]) {
+            /* Honest capture time: A/V sync and gap detection both key
+             * off this. NOW would claim up to a window of latency away. */
+            *params->qpcpos = stream->loopback_ts[stream->lcl_offs_frames];
+        } else { /* fixme: qpc of recording time */
+            NtQueryPerformanceCounter(&stamp, &freq);
+            *params->qpcpos = (stamp.QuadPart * (INT64)10000000) / freq.QuadPart;
+        }
     }
     params->result = S_OK;
 
