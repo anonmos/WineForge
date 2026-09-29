@@ -106,6 +106,8 @@ struct coreaudio_stream
     UINT64 loopback_seq;
     UINT64 loopback_consumed;
     UINT64 loopback_last_ns;
+    UINT64 loopback_first;
+    UINT32 loopback_frames;
     BYTE *loopback_snap;
     size_t loopback_snap_size;
 };
@@ -489,7 +491,31 @@ static UINT64 wsaf_le64(const BYTE *p)
 }
 
 /* Caller holds stream->lock. Tops up local_buffer from the latest helper
- * snapshot; drops oldest on overflow like the converter path does. */
+ * snapshot, metered to realtime pace; feeds silence when no fresh audio
+ * exists so Steam never sees a starving capture (starvation resumption
+ * bursts read as audio gaps and sound choppy). Drops oldest on overflow
+ * like the converter path does. */
+static void loopback_commit(struct coreaudio_stream *stream, UINT32 frames)
+{
+    stream->wri_offs_frames = (UINT32)((stream->wri_offs_frames + frames) % stream->bufsize_frames);
+    if ((UINT64)stream->held_frames + frames > stream->bufsize_frames) {
+        stream->lcl_offs_frames = (UINT32)((stream->lcl_offs_frames + (stream->held_frames + frames - stream->bufsize_frames)) % stream->bufsize_frames);
+        stream->held_frames = stream->bufsize_frames;
+    } else
+        stream->held_frames += frames;
+}
+
+static void loopback_feed_silence(struct coreaudio_stream *stream, UINT32 frames)
+{
+    UINT32 align = stream->fmt->nBlockAlign;
+    UINT32 first = stream->bufsize_frames - stream->wri_offs_frames;
+    if (first > frames) first = frames;
+    silence_buffer(stream, stream->local_buffer + stream->wri_offs_frames * align, first);
+    if (frames > first)
+        silence_buffer(stream, stream->local_buffer, frames - first);
+    loopback_commit(stream, frames);
+}
+
 static void loopback_pump(struct coreaudio_stream *stream)
 {
     const char *path = getenv("WINE_LOOPBACK_AUDIO_PATH");
@@ -497,13 +523,31 @@ static void loopback_pump(struct coreaudio_stream *stream)
     UINT32 rate, channels, format, frames;
     UINT64 seq, timestamp_ns, first_frame, now_ns, skip, fresh;
     UINT32 align = stream->fmt->nBlockAlign;
-    struct timespec now;
+    struct timespec now, pt;
+    UINT64 pnow, elapsed, due;
     size_t need;
-    FILE *f;    if (!path || !*path) path = "/private/tmp/wine-sck-probe/audio.wsaf";
-    if (!(f = fopen(path, "rb"))) return;
+    FILE *f;
+
+    /* Realtime budget for this pump call shared by data and silence.
+     * Deliberately no headroom: unconditional padding would let a
+     * fast-polling consumer spin forever on an always-full buffer.
+     * Recovery from an empty buffer gets one period immediately. */
+    clock_gettime(CLOCK_MONOTONIC, &pt);
+    pnow = (UINT64)pt.tv_sec * 1000000000ULL + pt.tv_nsec;
+    elapsed = pnow > stream->loopback_last_ns ? pnow - stream->loopback_last_ns : 0;
+    stream->loopback_last_ns = pnow;
+    due = elapsed * LOOPBACK_RATE / 1000000000ULL;
+    if (due > stream->bufsize_frames / 4) due = stream->bufsize_frames / 4;
+
+    if (!path || !*path) path = "/private/tmp/wine-sck-probe/audio.wsaf";
+    if (!(f = fopen(path, "rb"))) {
+        if (due) loopback_feed_silence(stream, (UINT32)due);
+        return;
+    }
     if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr) ||
         memcmp(hdr, "WSAF", 4) || wsaf_le32(hdr + 4) != 1) {
         fclose(f);
+        if (due) loopback_feed_silence(stream, (UINT32)due);
         return;
     }
     seq = wsaf_le64(hdr + 8);
@@ -516,16 +560,43 @@ static void loopback_pump(struct coreaudio_stream *stream)
     if (rate != LOOPBACK_RATE || channels != LOOPBACK_CHANNELS || format != 3 ||
         !frames || (UINT64)frames * align > WSAF_MAX_BYTES) {
         fclose(f);
+        if (due) loopback_feed_silence(stream, (UINT32)due);
         return;
     }
     clock_gettime(CLOCK_REALTIME, &now);
     now_ns = (UINT64)now.tv_sec * 1000000000ULL + now.tv_nsec;
     if (now_ns < timestamp_ns || now_ns - timestamp_ns > WSAF_STALE_NS) {
         fclose(f);
+        if (due) loopback_feed_silence(stream, (UINT32)due);
         return;
     }
     if (seq == stream->loopback_seq) {
         fclose(f);
+        /* Same snapshot: feed paced leftovers from the cached copy. */
+        if (!stream->loopback_snap) {
+            if (due) loopback_feed_silence(stream, (UINT32)due);
+            return;
+        }
+        skip = stream->loopback_consumed > stream->loopback_first ?
+            stream->loopback_consumed - stream->loopback_first : 0;
+        if (skip >= stream->loopback_frames) {
+            if (due) loopback_feed_silence(stream, (UINT32)due);
+            return;
+        }
+        fresh = stream->loopback_frames - (UINT32)skip;
+        if (!stream->held_frames && fresh && due < stream->period_frames) {
+            due = fresh;
+            if (due > stream->period_frames) due = stream->period_frames;
+        }
+        if ((UINT64)fresh > due) fresh = (UINT32)due;
+        if (!fresh) return;
+        ca_wrap_buffer(stream->local_buffer,
+                       stream->wri_offs_frames * align,
+                       stream->bufsize_frames * align,
+                       stream->loopback_snap + (size_t)skip * align,
+                       (size_t)fresh * align);
+        loopback_commit(stream, (UINT32)fresh);
+        stream->loopback_consumed += fresh;
         return;
     }
     stream->loopback_seq = seq;
@@ -536,56 +607,50 @@ static void loopback_pump(struct coreaudio_stream *stream)
     skip = stream->loopback_consumed > first_frame ? stream->loopback_consumed - first_frame : 0;
     if (skip >= frames) {
         fclose(f);
+        if (due) loopback_feed_silence(stream, (UINT32)due);
         return;
     }
     fresh = frames - (UINT32)skip;
+    if (!stream->held_frames && fresh && due < stream->period_frames) {
+        due = fresh;
+        if (due > stream->period_frames) due = stream->period_frames;
+    }
     /* Meter bursty snapshots out at realtime pace. Dumping a whole
      * snapshot at once makes the capture position jump backward by up
      * to the window size, which Steam reports as audio gaps (and plays
-     * as choppy stutter). Unfed leftovers stay unconsumed for the next
-     * overlapping snapshot. */
-    {
-        struct timespec pt;
-        UINT64 pnow, elapsed, due;
-        clock_gettime(CLOCK_MONOTONIC, &pt);
-        pnow = (UINT64)pt.tv_sec * 1000000000ULL + pt.tv_nsec;
-        elapsed = pnow > stream->loopback_last_ns ? pnow - stream->loopback_last_ns : 0;
-        stream->loopback_last_ns = pnow;
-        due = elapsed * LOOPBACK_RATE / 1000000000ULL + stream->period_frames;
-        if (due > stream->bufsize_frames / 4) due = stream->bufsize_frames / 4;
-        if ((UINT64)fresh > due) fresh = (UINT32)due;
-        if (!fresh) {
-            fclose(f);
-            return;
-        }
+     * as choppy stutter). Unfed leftovers stay cached for later pumps. */
+    if ((UINT64)fresh > due) fresh = (UINT32)due;
+    if (!fresh) {
+        fclose(f);
+        return;
     }
-    need = (size_t)fresh * align;
+    need = (size_t)frames * align;
     if (need > stream->loopback_snap_size) {
         free(stream->loopback_snap);
         stream->loopback_snap = malloc(need);
         stream->loopback_snap_size = stream->loopback_snap ? need : 0;
         if (!stream->loopback_snap) {
             fclose(f);
+            if (due) loopback_feed_silence(stream, (UINT32)due);
             return;
         }
     }
-    if (fseek(f, (long)(WSAF_HEADER_SIZE + (size_t)skip * align), SEEK_SET) ||
+    if (fseek(f, (long)WSAF_HEADER_SIZE, SEEK_SET) ||
         fread(stream->loopback_snap, 1, need, f) != need) {
         fclose(f);
+        if (due) loopback_feed_silence(stream, (UINT32)due);
         return;
     }
     fclose(f);
 
+    stream->loopback_first = first_frame;
+    stream->loopback_frames = frames;
     ca_wrap_buffer(stream->local_buffer,
                    stream->wri_offs_frames * align,
                    stream->bufsize_frames * align,
-                   stream->loopback_snap, need);
-    stream->wri_offs_frames = (UINT32)((stream->wri_offs_frames + fresh) % stream->bufsize_frames);
-    if ((UINT64)stream->held_frames + fresh > stream->bufsize_frames) {
-        stream->lcl_offs_frames = (UINT32)((stream->lcl_offs_frames + (stream->held_frames + fresh - stream->bufsize_frames)) % stream->bufsize_frames);
-        stream->held_frames = stream->bufsize_frames;
-    } else
-        stream->held_frames += (UINT32)fresh;
+                   stream->loopback_snap + (size_t)skip * align,
+                   (size_t)fresh * align);
+    loopback_commit(stream, (UINT32)fresh);
     stream->loopback_consumed = first_frame + skip + fresh;
 }
 
