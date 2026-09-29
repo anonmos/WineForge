@@ -1073,9 +1073,9 @@ static NTSTATUS unix_create_stream(void *args)
         stream->flow = eCapture;
         stream->flags = params->flags;
         stream->share = params->share;
-        stream->period_frames = LOOPBACK_RATE / 100;
+        stream->period_frames = LOOPBACK_RATE / 200;
         if (!stream->period_frames) stream->period_frames = 1;
-        stream->period = 100000;
+        stream->period = 50000;
         stream->bufsize_frames = muldiv(params->duration, LOOPBACK_RATE, 10000000);
         if (!stream->bufsize_frames) stream->bufsize_frames = LOOPBACK_RATE;
         size = stream->bufsize_frames * stream->fmt->nBlockAlign;
@@ -1785,6 +1785,14 @@ static void unix_timer_loop(void *args)
     next.QuadPart = last.QuadPart + stream->period;
 
     while(!stream->please_quit){
+        if (stream->loopback) {
+            /* Hardware equivalent: accumulate capture data on a realtime
+             * tick independent of consumer polling, so drain loops always
+             * find smooth data and positions advance evenly. */
+            os_unfair_lock_lock(&stream->lock);
+            loopback_pump(stream);
+            os_unfair_lock_unlock(&stream->lock);
+        }
         NtSetEvent(stream->event, NULL);
         NtDelayExecution(FALSE, &delay);
         NtQueryPerformanceCounter(&last, NULL);
