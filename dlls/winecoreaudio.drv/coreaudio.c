@@ -36,6 +36,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
@@ -101,6 +102,11 @@ struct coreaudio_stream
     INT32 getbuf_last;
     WAVEFORMATEX *fmt;
     BYTE *local_buffer, *cap_buffer, *wrap_buffer, *resamp_buffer, *tmp_buffer;
+    BOOL loopback;
+    UINT64 loopback_seq;
+    UINT64 loopback_consumed;
+    BYTE *loopback_snap;
+    size_t loopback_snap_size;
 };
 
 static ULONG_PTR zero_bits = 0;
@@ -412,6 +418,170 @@ static void ca_wrap_buffer(BYTE *dst, UINT32 dst_offs, UINT32 dst_bytes,
         memcpy(dst, src + chunk_bytes, src_bytes - chunk_bytes);
     }else
         memcpy(dst + dst_offs, src, src_bytes);
+}
+
+/* ScreenCaptureKit-fed loopback capture for Steam Remote Play host audio.
+ *
+ * macOS offers no monitor/loopback audio device, so the WASAPI loopback
+ * init used by Steam always failed with E_NOTIMPL here. Instead we expose
+ * a virtual capture device whose samples come from WSAF snapshots
+ * published by the native helper
+ * (tools/steam-capture-probe/WineCaptureProbe.swift). Until the helper
+ * feeds audio, the stream is valid but yields no packets (silence).
+ *
+ * WSAF snapshot layout, all little-endian:
+ *   magic[4] "WSAF", version u32 == 1, seq u64, timestamp_ns u64,
+ *   rate u32, channels u32, format u32 (3 == IEEE float),
+ *   frames u32, first_frame u64 (absolute sample counter of frame 0),
+ *   followed by frames * channels float32 samples.
+ * The writer publishes via tmp-file + rename, so readers never tear.
+ */
+#define LOOPBACK_DEVICE_NAME "Wine SCK Loopback"
+#define LOOPBACK_RATE 48000
+#define LOOPBACK_CHANNELS 2
+#define WSAF_HEADER_SIZE 48
+#define WSAF_MAX_BYTES (8 * 1024 * 1024)
+#define WSAF_STALE_NS (2000000000ULL)
+
+static BOOL is_loopback_device(const char *device)
+{
+    return device && !strcmp(device, LOOPBACK_DEVICE_NAME);
+}
+
+static BOOL loopback_format_ok(const WAVEFORMATEX *fmt)
+{
+    const WAVEFORMATEXTENSIBLE *ext;
+    if (!fmt || fmt->nChannels != LOOPBACK_CHANNELS ||
+        fmt->nSamplesPerSec != LOOPBACK_RATE || fmt->wBitsPerSample != 32)
+        return FALSE;
+    if (fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT)
+        return TRUE;
+    if (fmt->wFormatTag != WAVE_FORMAT_EXTENSIBLE || fmt->cbSize < 22)
+        return FALSE;
+    ext = (const WAVEFORMATEXTENSIBLE *)fmt;
+    return IsEqualGUID(&ext->SubFormat, &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
+}
+
+static void loopback_fill_mix(WAVEFORMATEXTENSIBLE *fmt)
+{
+    memset(fmt, 0, sizeof(*fmt));
+    fmt->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+    fmt->Format.nChannels = LOOPBACK_CHANNELS;
+    fmt->Format.nSamplesPerSec = LOOPBACK_RATE;
+    fmt->Format.wBitsPerSample = 32;
+    fmt->SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+    fmt->Format.nBlockAlign = LOOPBACK_CHANNELS * 4;
+    fmt->Format.nAvgBytesPerSec = LOOPBACK_RATE * LOOPBACK_CHANNELS * 4;
+    fmt->Samples.wValidBitsPerSample = 32;
+    fmt->Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+    fmt->dwChannelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
+}
+
+static UINT32 wsaf_le32(const BYTE *p)
+{
+    return (UINT32)p[0] | ((UINT32)p[1] << 8) | ((UINT32)p[2] << 16) | ((UINT32)p[3] << 24);
+}
+
+static UINT64 wsaf_le64(const BYTE *p)
+{
+    return (UINT64)wsaf_le32(p) | ((UINT64)wsaf_le32(p + 4) << 32);
+}
+
+/* Caller holds stream->lock. Tops up local_buffer from the latest helper
+ * snapshot; drops oldest on overflow like the converter path does. */
+static void loopback_pump(struct coreaudio_stream *stream)
+{
+    const char *path = getenv("WINE_LOOPBACK_AUDIO_PATH");
+    BYTE hdr[WSAF_HEADER_SIZE];
+    UINT32 rate, channels, format, frames;
+    UINT64 seq, timestamp_ns, first_frame, now_ns, skip, fresh;
+    UINT32 align = stream->fmt->nBlockAlign;
+    struct timespec now;
+    size_t need;
+    FILE *f;
+
+    if (!path || !*path) path = "/private/tmp/wine-sck-probe/audio.wsaf";
+    if (!(f = fopen(path, "rb"))) return;
+    if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr) ||
+        memcmp(hdr, "WSAF", 4) || wsaf_le32(hdr + 4) != 1) {
+        fclose(f);
+        return;
+    }
+    seq = wsaf_le64(hdr + 8);
+    timestamp_ns = wsaf_le64(hdr + 16);
+    rate = wsaf_le32(hdr + 24);
+    channels = wsaf_le32(hdr + 28);
+    format = wsaf_le32(hdr + 32);
+    frames = wsaf_le32(hdr + 36);
+    first_frame = wsaf_le64(hdr + 40);
+    if (rate != LOOPBACK_RATE || channels != LOOPBACK_CHANNELS || format != 3 ||
+        !frames || (UINT64)frames * align > WSAF_MAX_BYTES) {
+        fclose(f);
+        return;
+    }
+    clock_gettime(CLOCK_REALTIME, &now);
+    now_ns = (UINT64)now.tv_sec * 1000000000ULL + now.tv_nsec;
+    if (now_ns < timestamp_ns || now_ns - timestamp_ns > WSAF_STALE_NS) {
+        fclose(f);
+        return;
+    }
+    if (seq == stream->loopback_seq) {
+        fclose(f);
+        return;
+    }
+    stream->loopback_seq = seq;
+    /* Helper restart or a huge gap means the absolute counter reset. */
+    if (first_frame > stream->loopback_consumed ||
+        stream->loopback_consumed - first_frame > (UINT64)LOOPBACK_RATE * 10)
+        stream->loopback_consumed = first_frame;
+    skip = stream->loopback_consumed > first_frame ? stream->loopback_consumed - first_frame : 0;
+    if (skip >= frames) {
+        fclose(f);
+        return;
+    }
+    fresh = frames - (UINT32)skip;
+    need = (size_t)fresh * align;
+    if (need > stream->loopback_snap_size) {
+        free(stream->loopback_snap);
+        stream->loopback_snap = malloc(need);
+        stream->loopback_snap_size = stream->loopback_snap ? need : 0;
+        if (!stream->loopback_snap) {
+            fclose(f);
+            return;
+        }
+    }
+    if (fseek(f, (long)(WSAF_HEADER_SIZE + (size_t)skip * align), SEEK_SET) ||
+        fread(stream->loopback_snap, 1, need, f) != need) {
+        fclose(f);
+        return;
+    }
+    fclose(f);
+
+    ca_wrap_buffer(stream->local_buffer,
+                   stream->wri_offs_frames * align,
+                   stream->bufsize_frames * align,
+                   stream->loopback_snap, need);
+    stream->wri_offs_frames = (UINT32)((stream->wri_offs_frames + fresh) % stream->bufsize_frames);
+    if ((UINT64)stream->held_frames + fresh > stream->bufsize_frames) {
+        stream->lcl_offs_frames = (UINT32)((stream->lcl_offs_frames + (stream->held_frames + fresh - stream->bufsize_frames)) % stream->bufsize_frames);
+        stream->held_frames = stream->bufsize_frames;
+    } else
+        stream->held_frames += (UINT32)fresh;
+    stream->loopback_consumed = first_frame + frames;
+}
+
+static NTSTATUS unix_get_loopback_capture_device(void *args)
+{
+    struct get_loopback_capture_device_params *params = args;
+    UINT32 len = strlen(LOOPBACK_DEVICE_NAME) + 1;
+    if (len <= params->ret_device_len) {
+        memcpy(params->ret_device, LOOPBACK_DEVICE_NAME, len);
+        params->result = S_OK;
+    } else {
+        params->ret_device_len = len;
+        params->result = STATUS_BUFFER_TOO_SMALL;
+    }
+    return STATUS_SUCCESS;
 }
 
 /* we need to trigger CA to pull data from the device and give it to us
@@ -809,6 +979,32 @@ static NTSTATUS unix_create_stream(void *args)
     }
 
     stream->period_frames = muldiv(params->period, stream->fmt->nSamplesPerSec, 10000000);
+
+    if (params->flow == eCapture && is_loopback_device(params->device)) {
+        if (!loopback_format_ok(params->fmt)) {
+            params->result = AUDCLNT_E_UNSUPPORTED_FORMAT;
+            goto end;
+        }
+        stream->loopback = TRUE;
+        stream->flow = eCapture;
+        stream->flags = params->flags;
+        stream->share = params->share;
+        stream->period_frames = LOOPBACK_RATE / 100;
+        if (!stream->period_frames) stream->period_frames = 1;
+        stream->period = 100000;
+        stream->bufsize_frames = muldiv(params->duration, LOOPBACK_RATE, 10000000);
+        if (!stream->bufsize_frames) stream->bufsize_frames = LOOPBACK_RATE;
+        size = stream->bufsize_frames * stream->fmt->nBlockAlign;
+        if (NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer, zero_bits,
+                                    &size, MEM_COMMIT, PAGE_READWRITE)) {
+            params->result = E_OUTOFMEMORY;
+            goto end;
+        }
+        silence_buffer(stream, stream->local_buffer, stream->bufsize_frames);
+        params->result = S_OK;
+        goto end;
+    }
+
     if (stream->period_frames == 0)
     {
         params->result = E_INVALIDARG;
@@ -923,6 +1119,7 @@ static NTSTATUS unix_release_stream( void *args )
     free(stream->resamp_buffer);
     free(stream->wrap_buffer);
     free(stream->cap_buffer);
+    free(stream->loopback_snap);
     if(stream->local_buffer){
         size = 0;
         NtFreeVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer,
@@ -1092,7 +1289,15 @@ static NTSTATUS unix_get_mix_format(void *args)
     UInt32 size;
     OSStatus sc;
     int i;
-    const AudioDeviceID dev_id = dev_id_from_device(params->device);
+    AudioDeviceID dev_id;
+
+    if (is_loopback_device(params->device)) {
+        loopback_fill_mix(params->fmt);
+        params->result = S_OK;
+        return STATUS_SUCCESS;
+    }
+
+    dev_id = dev_id_from_device(params->device);
 
     params->fmt->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
 
@@ -1184,7 +1389,14 @@ static NTSTATUS unix_is_format_supported(void *args)
     AudioStreamBasicDescription dev_desc;
     AudioConverterRef converter;
     AudioComponentInstance unit;
-    const AudioDeviceID dev_id = dev_id_from_device(params->device);
+    AudioDeviceID dev_id;
+
+    if (is_loopback_device(params->device)) {
+        params->result = loopback_format_ok(params->fmt_in) ? S_OK : AUDCLNT_E_UNSUPPORTED_FORMAT;
+        return STATUS_SUCCESS;
+    }
+
+    dev_id = dev_id_from_device(params->device);
 
     unit = get_audiounit(params->flow, dev_id);
 
@@ -1201,6 +1413,13 @@ static NTSTATUS unix_get_device_period(void *args)
     struct get_device_period_params *params = args;
     unsigned int n_samples_per_sec;
     AudioDeviceID dev_id;
+
+    if (is_loopback_device(params->device)) {
+        if (params->def_period) *params->def_period = 100000;
+        if (params->min_period) *params->min_period = 30000;
+        params->result = S_OK;
+        return STATUS_SUCCESS;
+    }
 
     dev_id = dev_id_from_device(params->device);
     if (FAILED(params->result = get_device_sample_rate(dev_id, params->flow, &n_samples_per_sec)))
@@ -1289,6 +1508,12 @@ static void capture_resample(struct coreaudio_stream *stream)
     UINT32 resamp_period_frames = muldiv(stream->period_frames, stream->dev_desc.mSampleRate,
                                          stream->fmt->nSamplesPerSec);
     OSStatus sc;
+
+    /* Loopback streams are fed straight from the helper in stream format. */
+    if (stream->loopback) {
+        loopback_pump(stream);
+        return;
+    }
 
     /* the resampling process often needs more source frames than we'd
      * guess from a straight conversion using the sample rate ratio. so
@@ -1405,6 +1630,13 @@ static NTSTATUS unix_get_latency(void *args)
     OSStatus sc;
 
     os_unfair_lock_lock(&stream->lock);
+
+    if (stream->loopback) {
+        *params->latency = stream->period;
+        os_unfair_lock_unlock(&stream->lock);
+        params->result = S_OK;
+        return STATUS_SUCCESS;
+    }
 
     addr.mScope = get_scope(stream->flow);
     addr.mSelector = kAudioDevicePropertyLatency;
@@ -1955,7 +2187,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     unix_get_capture_buffer,
     unix_release_capture_buffer,
     unix_is_format_supported,
-    unix_not_implemented,
+    unix_get_loopback_capture_device,
     unix_get_mix_format,
     unix_get_device_period,
     unix_get_buffer_size,
@@ -2138,6 +2370,31 @@ static NTSTATUS unix_wow64_is_format_supported(void *args)
     };
     unix_is_format_supported(&params);
     params32->result = params.result;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS unix_wow64_get_loopback_capture_device(void *args)
+{
+    struct
+    {
+        PTR32 name;
+        PTR32 device;
+        PTR32 ret_device;
+        UINT32 ret_device_len;
+        HRESULT result;
+    } *params32 = args;
+
+    struct get_loopback_capture_device_params params =
+    {
+        .name = ULongToPtr(params32->name),
+        .device = ULongToPtr(params32->device),
+        .ret_device = ULongToPtr(params32->ret_device),
+        .ret_device_len = params32->ret_device_len,
+    };
+
+    unix_get_loopback_capture_device(&params);
+    params32->result = params.result;
+    params32->ret_device_len = params.ret_device_len;
     return STATUS_SUCCESS;
 }
 
@@ -2405,7 +2662,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     unix_wow64_get_capture_buffer,
     unix_release_capture_buffer,
     unix_wow64_is_format_supported,
-    unix_not_implemented,
+    unix_wow64_get_loopback_capture_device,
     unix_wow64_get_mix_format,
     unix_wow64_get_device_period,
     unix_wow64_get_buffer_size,
