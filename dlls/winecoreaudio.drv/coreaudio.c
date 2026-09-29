@@ -516,7 +516,7 @@ static void loopback_feed_silence(struct coreaudio_stream *stream, UINT32 frames
     loopback_commit(stream, frames);
 }
 
-static void loopback_pump(struct coreaudio_stream *stream)
+static void loopback_pump(struct coreaudio_stream *stream, int timer)
 {
     const char *path = getenv("WINE_LOOPBACK_AUDIO_PATH");
     BYTE hdr[WSAF_HEADER_SIZE];
@@ -524,30 +524,36 @@ static void loopback_pump(struct coreaudio_stream *stream)
     UINT64 seq, timestamp_ns, first_frame, now_ns, skip, fresh;
     UINT32 align = stream->fmt->nBlockAlign;
     struct timespec now, pt;
-    UINT64 pnow, elapsed, due;
+    UINT64 pnow, elapsed, due, allow;
     size_t need;
     FILE *f;
 
-    /* Realtime budget for this pump call shared by data and silence.
-     * Deliberately no headroom: unconditional padding would let a
-     * fast-polling consumer spin forever on an always-full buffer.
-     * Recovery from an empty buffer gets one period immediately. */
+    /* Realtime budget shared by data and silence. The timer tick is the
+     * primary feeder (hardware-callback equivalent); consumer polls only
+     * perform emergency recovery from an empty buffer so positions
+     * advance exactly like hardware: small frequent uniform steps. */
     clock_gettime(CLOCK_MONOTONIC, &pt);
     pnow = (UINT64)pt.tv_sec * 1000000000ULL + pt.tv_nsec;
     elapsed = pnow > stream->loopback_last_ns ? pnow - stream->loopback_last_ns : 0;
     stream->loopback_last_ns = pnow;
     due = elapsed * LOOPBACK_RATE / 1000000000ULL;
     if (due > stream->bufsize_frames / 4) due = stream->bufsize_frames / 4;
+    if (timer) {
+        allow = due;
+        if (stream->held_frames < 240) allow += 240 - stream->held_frames;
+    } else {
+        allow = stream->held_frames == 0 ? stream->period_frames : 0;
+    }
 
     if (!path || !*path) path = "/private/tmp/wine-sck-probe/audio.wsaf";
     if (!(f = fopen(path, "rb"))) {
-        if (due) loopback_feed_silence(stream, (UINT32)due);
+        if (allow) loopback_feed_silence(stream, (UINT32)allow);
         return;
     }
     if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr) ||
         memcmp(hdr, "WSAF", 4) || wsaf_le32(hdr + 4) != 1) {
         fclose(f);
-        if (due) loopback_feed_silence(stream, (UINT32)due);
+        if (allow) loopback_feed_silence(stream, (UINT32)allow);
         return;
     }
     seq = wsaf_le64(hdr + 8);
@@ -560,35 +566,31 @@ static void loopback_pump(struct coreaudio_stream *stream)
     if (rate != LOOPBACK_RATE || channels != LOOPBACK_CHANNELS || format != 3 ||
         !frames || (UINT64)frames * align > WSAF_MAX_BYTES) {
         fclose(f);
-        if (due) loopback_feed_silence(stream, (UINT32)due);
+        if (allow) loopback_feed_silence(stream, (UINT32)allow);
         return;
     }
     clock_gettime(CLOCK_REALTIME, &now);
     now_ns = (UINT64)now.tv_sec * 1000000000ULL + now.tv_nsec;
     if (now_ns < timestamp_ns || now_ns - timestamp_ns > WSAF_STALE_NS) {
         fclose(f);
-        if (due) loopback_feed_silence(stream, (UINT32)due);
+        if (allow) loopback_feed_silence(stream, (UINT32)allow);
         return;
     }
     if (seq == stream->loopback_seq) {
         fclose(f);
         /* Same snapshot: feed paced leftovers from the cached copy. */
         if (!stream->loopback_snap) {
-            if (due) loopback_feed_silence(stream, (UINT32)due);
+            if (allow) loopback_feed_silence(stream, (UINT32)allow);
             return;
         }
         skip = stream->loopback_consumed > stream->loopback_first ?
             stream->loopback_consumed - stream->loopback_first : 0;
         if (skip >= stream->loopback_frames) {
-            if (due) loopback_feed_silence(stream, (UINT32)due);
+            if (allow) loopback_feed_silence(stream, (UINT32)allow);
             return;
         }
         fresh = stream->loopback_frames - (UINT32)skip;
-        if (!stream->held_frames && fresh && due < stream->period_frames) {
-            due = fresh;
-            if (due > stream->period_frames) due = stream->period_frames;
-        }
-        if ((UINT64)fresh > due) fresh = (UINT32)due;
+        if ((UINT64)fresh > allow) fresh = (UINT32)allow;
         if (!fresh) return;
         ca_wrap_buffer(stream->local_buffer,
                        stream->wri_offs_frames * align,
@@ -607,19 +609,13 @@ static void loopback_pump(struct coreaudio_stream *stream)
     skip = stream->loopback_consumed > first_frame ? stream->loopback_consumed - first_frame : 0;
     if (skip >= frames) {
         fclose(f);
-        if (due) loopback_feed_silence(stream, (UINT32)due);
+        if (allow) loopback_feed_silence(stream, (UINT32)allow);
         return;
     }
     fresh = frames - (UINT32)skip;
-    if (!stream->held_frames && fresh && due < stream->period_frames) {
-        due = fresh;
-        if (due > stream->period_frames) due = stream->period_frames;
-    }
-    /* Meter bursty snapshots out at realtime pace. Dumping a whole
-     * snapshot at once makes the capture position jump backward by up
-     * to the window size, which Steam reports as audio gaps (and plays
-     * as choppy stutter). Unfed leftovers stay cached for later pumps. */
-    if ((UINT64)fresh > due) fresh = (UINT32)due;
+    /* Meter bursty snapshots out at the caller's allowance. Unfed
+     * leftovers stay cached for later pumps. */
+    if ((UINT64)fresh > allow) fresh = (UINT32)allow;
     if (!fresh) {
         fclose(f);
         return;
@@ -631,14 +627,14 @@ static void loopback_pump(struct coreaudio_stream *stream)
         stream->loopback_snap_size = stream->loopback_snap ? need : 0;
         if (!stream->loopback_snap) {
             fclose(f);
-            if (due) loopback_feed_silence(stream, (UINT32)due);
+            if (allow) loopback_feed_silence(stream, (UINT32)allow);
             return;
         }
     }
     if (fseek(f, (long)WSAF_HEADER_SIZE, SEEK_SET) ||
         fread(stream->loopback_snap, 1, need, f) != need) {
         fclose(f);
-        if (due) loopback_feed_silence(stream, (UINT32)due);
+        if (allow) loopback_feed_silence(stream, (UINT32)allow);
         return;
     }
     fclose(f);
@@ -1600,7 +1596,7 @@ static void capture_resample(struct coreaudio_stream *stream)
 
     /* Loopback streams are fed straight from the helper in stream format. */
     if (stream->loopback) {
-        loopback_pump(stream);
+        loopback_pump(stream, 0);
         return;
     }
 
@@ -1790,7 +1786,7 @@ static void unix_timer_loop(void *args)
              * tick independent of consumer polling, so drain loops always
              * find smooth data and positions advance evenly. */
             os_unfair_lock_lock(&stream->lock);
-            loopback_pump(stream);
+            loopback_pump(stream, 1);
             os_unfair_lock_unlock(&stream->lock);
         }
         NtSetEvent(stream->event, NULL);
