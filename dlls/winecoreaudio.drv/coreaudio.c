@@ -108,6 +108,7 @@ struct coreaudio_stream
     UINT64 loopback_last_ns;
     UINT64 loopback_first;
     UINT32 loopback_frames;
+    UINT64 loopback_snap_ts;
     BYTE *loopback_snap;
     size_t loopback_snap_size;
 };
@@ -445,6 +446,7 @@ static void ca_wrap_buffer(BYTE *dst, UINT32 dst_offs, UINT32 dst_bytes,
 #define WSAF_HEADER_SIZE 48
 #define WSAF_MAX_BYTES (8 * 1024 * 1024)
 #define WSAF_STALE_NS (2000000000ULL)
+#define WSAF_QUIET_NS (500000000ULL)
 
 static BOOL is_loopback_device(const char *device)
 {
@@ -538,6 +540,8 @@ static void loopback_pump(struct coreaudio_stream *stream, int timer)
     stream->loopback_last_ns = pnow;
     due = elapsed * LOOPBACK_RATE / 1000000000ULL;
     if (due > stream->bufsize_frames / 4) due = stream->bufsize_frames / 4;
+    clock_gettime(CLOCK_REALTIME, &now);
+    now_ns = (UINT64)now.tv_sec * 1000000000ULL + now.tv_nsec;
     if (timer) {
         allow = due;
         if (stream->held_frames < 240) allow += 240 - stream->held_frames;
@@ -547,13 +551,13 @@ static void loopback_pump(struct coreaudio_stream *stream, int timer)
 
     if (!path || !*path) path = "/private/tmp/wine-sck-probe/audio.wsaf";
     if (!(f = fopen(path, "rb"))) {
-        if (allow) loopback_feed_silence(stream, (UINT32)allow);
+        if (allow && (stream->loopback_snap_ts == 0 || (now_ns >= stream->loopback_snap_ts && now_ns - stream->loopback_snap_ts > WSAF_QUIET_NS))) loopback_feed_silence(stream, (UINT32)allow);
         return;
     }
     if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr) ||
         memcmp(hdr, "WSAF", 4) || wsaf_le32(hdr + 4) != 1) {
         fclose(f);
-        if (allow) loopback_feed_silence(stream, (UINT32)allow);
+        if (allow && (stream->loopback_snap_ts == 0 || (now_ns >= stream->loopback_snap_ts && now_ns - stream->loopback_snap_ts > WSAF_QUIET_NS))) loopback_feed_silence(stream, (UINT32)allow);
         return;
     }
     seq = wsaf_le64(hdr + 8);
@@ -566,27 +570,25 @@ static void loopback_pump(struct coreaudio_stream *stream, int timer)
     if (rate != LOOPBACK_RATE || channels != LOOPBACK_CHANNELS || format != 3 ||
         !frames || (UINT64)frames * align > WSAF_MAX_BYTES) {
         fclose(f);
-        if (allow) loopback_feed_silence(stream, (UINT32)allow);
+        if (allow && (stream->loopback_snap_ts == 0 || (now_ns >= stream->loopback_snap_ts && now_ns - stream->loopback_snap_ts > WSAF_QUIET_NS))) loopback_feed_silence(stream, (UINT32)allow);
         return;
     }
-    clock_gettime(CLOCK_REALTIME, &now);
-    now_ns = (UINT64)now.tv_sec * 1000000000ULL + now.tv_nsec;
     if (now_ns < timestamp_ns || now_ns - timestamp_ns > WSAF_STALE_NS) {
         fclose(f);
-        if (allow) loopback_feed_silence(stream, (UINT32)allow);
+        if (allow && (stream->loopback_snap_ts == 0 || (now_ns >= stream->loopback_snap_ts && now_ns - stream->loopback_snap_ts > WSAF_QUIET_NS))) loopback_feed_silence(stream, (UINT32)allow);
         return;
     }
     if (seq == stream->loopback_seq) {
         fclose(f);
         /* Same snapshot: feed paced leftovers from the cached copy. */
         if (!stream->loopback_snap) {
-            if (allow) loopback_feed_silence(stream, (UINT32)allow);
+            if (allow && (stream->loopback_snap_ts == 0 || (now_ns >= stream->loopback_snap_ts && now_ns - stream->loopback_snap_ts > WSAF_QUIET_NS))) loopback_feed_silence(stream, (UINT32)allow);
             return;
         }
         skip = stream->loopback_consumed > stream->loopback_first ?
             stream->loopback_consumed - stream->loopback_first : 0;
         if (skip >= stream->loopback_frames) {
-            if (allow) loopback_feed_silence(stream, (UINT32)allow);
+            if (allow && (stream->loopback_snap_ts == 0 || (now_ns >= stream->loopback_snap_ts && now_ns - stream->loopback_snap_ts > WSAF_QUIET_NS))) loopback_feed_silence(stream, (UINT32)allow);
             return;
         }
         fresh = stream->loopback_frames - (UINT32)skip;
@@ -609,7 +611,7 @@ static void loopback_pump(struct coreaudio_stream *stream, int timer)
     skip = stream->loopback_consumed > first_frame ? stream->loopback_consumed - first_frame : 0;
     if (skip >= frames) {
         fclose(f);
-        if (allow) loopback_feed_silence(stream, (UINT32)allow);
+        if (allow && (stream->loopback_snap_ts == 0 || (now_ns >= stream->loopback_snap_ts && now_ns - stream->loopback_snap_ts > WSAF_QUIET_NS))) loopback_feed_silence(stream, (UINT32)allow);
         return;
     }
     fresh = frames - (UINT32)skip;
@@ -627,20 +629,21 @@ static void loopback_pump(struct coreaudio_stream *stream, int timer)
         stream->loopback_snap_size = stream->loopback_snap ? need : 0;
         if (!stream->loopback_snap) {
             fclose(f);
-            if (allow) loopback_feed_silence(stream, (UINT32)allow);
+            if (allow && (stream->loopback_snap_ts == 0 || (now_ns >= stream->loopback_snap_ts && now_ns - stream->loopback_snap_ts > WSAF_QUIET_NS))) loopback_feed_silence(stream, (UINT32)allow);
             return;
         }
     }
     if (fseek(f, (long)WSAF_HEADER_SIZE, SEEK_SET) ||
         fread(stream->loopback_snap, 1, need, f) != need) {
         fclose(f);
-        if (allow) loopback_feed_silence(stream, (UINT32)allow);
+        if (allow && (stream->loopback_snap_ts == 0 || (now_ns >= stream->loopback_snap_ts && now_ns - stream->loopback_snap_ts > WSAF_QUIET_NS))) loopback_feed_silence(stream, (UINT32)allow);
         return;
     }
     fclose(f);
 
     stream->loopback_first = first_frame;
     stream->loopback_frames = frames;
+    stream->loopback_snap_ts = timestamp_ns;
     ca_wrap_buffer(stream->local_buffer,
                    stream->wri_offs_frames * align,
                    stream->bufsize_frames * align,
