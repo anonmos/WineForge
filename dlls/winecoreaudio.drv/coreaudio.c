@@ -500,6 +500,8 @@ static UINT64 wsaf_le64(const BYTE *p)
  * like the converter path does. */
 static void loopback_commit(struct coreaudio_stream *stream, UINT32 frames)
 {
+    if (frames > 960)
+        WARN("loopback large commit %u frames (held %u)\n", frames, stream->held_frames);
     stream->wri_offs_frames = (UINT32)((stream->wri_offs_frames + frames) % stream->bufsize_frames);
     if ((UINT64)stream->held_frames + frames > stream->bufsize_frames) {
         stream->lcl_offs_frames = (UINT32)((stream->lcl_offs_frames + (stream->held_frames + frames - stream->bufsize_frames)) % stream->bufsize_frames);
@@ -590,8 +592,9 @@ static void loopback_pump(struct coreaudio_stream *stream, int timer)
 
     /* Realtime budget shared by data and silence. The timer tick is the
      * primary feeder (hardware-callback equivalent); consumer polls only
-     * perform emergency recovery from an empty buffer so positions
-     * advance exactly like hardware: small frequent uniform steps. */
+     * perform emergency recovery from an empty buffer. Deliberately no
+     * top-up cushion: feeding above realtime overfills the buffer under
+     * gulpy drain patterns and reads back as position overruns. */
     clock_gettime(CLOCK_MONOTONIC, &pt);
     pnow = (UINT64)pt.tv_sec * 1000000000ULL + pt.tv_nsec;
     elapsed = pnow > stream->loopback_last_ns ? pnow - stream->loopback_last_ns : 0;
@@ -602,7 +605,6 @@ static void loopback_pump(struct coreaudio_stream *stream, int timer)
     now_ns = (UINT64)now.tv_sec * 1000000000ULL + now.tv_nsec;
     if (timer) {
         allow = due;
-        if (stream->held_frames < 240) allow += 240 - stream->held_frames;
     } else {
         allow = stream->held_frames == 0 ? stream->period_frames : 0;
     }
