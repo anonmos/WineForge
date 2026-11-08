@@ -809,6 +809,8 @@ HWND get_desktop_window(void)
 
     if (thread_info->top_window) return thread_info->top_window;
 
+    TRACE( "no top_window, querying server\n" );
+
     /* don't create an actual explorer desktop window for services */
     is_service = is_service_process();
 
@@ -822,6 +824,7 @@ HWND get_desktop_window(void)
         }
     }
     SERVER_END_REQ;
+    TRACE( "server replied top_window %p\n", thread_info->top_window );
 
     if (!thread_info->top_window)
     {

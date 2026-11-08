@@ -742,10 +742,14 @@ ATOM WINAPI NtUserGetClassInfoEx( HINSTANCE instance, UNICODE_STRING *name, WNDC
     CLASS *class;
     ATOM atom = 0;
 
+    TRACE( "instance %p name %s\n", instance, debugstr_us(name) );
+
     /* create the desktop window to trigger builtin class registration */
     if (!is_desktop_class( name ) && !is_message_class( name )) get_desktop_window();
+    TRACE( "desktop step done\n" );
 
     if (!(class = find_class( instance, name ))) return 0;
+    TRACE( "find_class -> %p\n", class );
 
     while ((status = get_shared_class( class, &lock, &class_shm )) == STATUS_PENDING)
     {
