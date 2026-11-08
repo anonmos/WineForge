@@ -743,6 +743,7 @@ ATOM WINAPI NtUserGetClassInfoEx( HINSTANCE instance, UNICODE_STRING *name, WNDC
     ATOM atom = 0;
 
     TRACE( "instance %p name %s\n", instance, debugstr_us(name) );
+    TRACE( "is_desktop=%d is_message=%d\n", is_desktop_class( name ), is_message_class( name ) );
 
     /* create the desktop window to trigger builtin class registration */
     if (!is_desktop_class( name ) && !is_message_class( name )) get_desktop_window();

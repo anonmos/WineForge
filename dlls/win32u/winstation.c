@@ -807,6 +807,8 @@ HWND get_desktop_window(void)
     struct user_thread_info *thread_info = get_user_thread_info();
     BOOL is_service;
 
+    TRACE( "get_desktop_window thread_info %p top_window %p\n",
+           thread_info, thread_info ? thread_info->top_window : 0 );
     if (thread_info->top_window) return thread_info->top_window;
 
     TRACE( "no top_window, querying server\n" );
