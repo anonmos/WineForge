@@ -265,6 +265,7 @@ static NTSTATUS WINAPI macdrv_app_icon(void *arg, ULONG size)
     TRACE("()\n");
 
     count = 0;
+    memset( entries, 0, sizeof(entries) );
 
     res_info = NULL;
     EnumResourceNamesW(NULL, (LPCWSTR)RT_GROUP_ICON, get_first_resource, (LONG_PTR)&res_info);

@@ -172,6 +172,12 @@ CGImageRef create_cgimage_from_icon(HANDLE icon, int width, int height)
 
     TRACE("icon %p width %d height %d\n", icon, width, height);
 
+    if (width <= 0 || height <= 0 || width > 512 || height > 512)
+    {
+        WARN("rejecting insane icon size %dx%d\n", width, height);
+        return NULL;
+    }
+
     if (!width && !height)
     {
         ICONINFO info;
@@ -277,6 +283,11 @@ CFArrayRef create_app_icon_images(void)
         struct app_icon_entry *icon = &entries[i];
         CGImageRef cgimage = NULL;
         HICON handle = UlongToHandle(icon->icon);
+        if (!handle)
+        {
+            WARN("skipping entry %d with null icon handle\n", i);
+            continue;
+        }
         cgimage = create_cgimage_from_icon(handle, icon->width, icon->height);
         NtUserDestroyCursor(handle, 0);
 
