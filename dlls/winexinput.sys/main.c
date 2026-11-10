@@ -746,7 +746,11 @@ static NTSTATUS initialize_device(DEVICE_OBJECT *device)
     memset(&fdo->rt_caps, 0, sizeof(HIDP_VALUE_CAPS));
     memset(&fdo->brake_caps, 0, sizeof(HIDP_VALUE_CAPS));
     memset(&fdo->accel_caps, 0, sizeof(HIDP_VALUE_CAPS));
-    fdo->xbox_bt_quirks = FALSE;
+    /* add_device set the quirk before this runs; re-detect, never clear. */
+    if (!fdo->xbox_bt_quirks)
+        fdo->xbox_bt_quirks = !!wcsstr(fdo->base.device_id, L"VID_045E&PID_0B13");
+    if (fdo->xbox_bt_quirks) TRACE("Xbox BT quirks active in init for %s.\n",
+                                   debugstr_w(fdo->base.device_id));
     if (!(value_caps = malloc(sizeof(*value_caps) * caps.NumberInputValueCaps))) return STATUS_NO_MEMORY;
     status = HidP_GetValueCaps(HidP_Input, value_caps, &caps.NumberInputValueCaps, preparsed);
     if (status != HIDP_STATUS_SUCCESS) WARN("HidP_GetValueCaps returned %#lx\n", status);
