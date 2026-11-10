@@ -235,16 +235,16 @@ static void translate_report_to_xinput_state(struct func_device *fdo)
     else fdo->xinput_state.buttons = hat << 10;
     if (fdo->xbox_bt_quirks)
     {
-        /* Xbox BT firmware button order -> synthetic usage positions 1-10
-         * (ground truth: raw captures show LB=U7 RB=U8, so Back/Start sit
-         * at U5/U6; xinput1_3 expects LB/RB at 5/6, Back/Start at 7/8). */
-        static const BYTE xbox_btn_map[] = {1,2,3,4,7,8,5,6,9,10};
+        /* Xbox BT firmware order -> synthetic usage positions 1-10:
+         * A=1 B=2 X=4 Y=5 LB=7 RB=8 Back=11 Start=12 LClick=14 RClick=15
+         * (raw HID usage captures, Nov 2026). */
+        static const BYTE xbox_btn_map[] = {1,2,0,3,4,0,5,6,0,0,7,8,0,9,10};
         for (i = 0; i < count && i < 16; i++)
         {
             BYTE syn;
-            if (usages[i] < 1 || usages[i] > 10) continue;
+            if (usages[i] < 1 || usages[i] > 15) continue;
             syn = xbox_btn_map[usages[i] - 1];
-            fdo->xinput_state.buttons |= (1 << (syn - 1));
+            if (syn) fdo->xinput_state.buttons |= (1 << (syn - 1));
         }
     }
     else for (i = 0; i < count; i++)

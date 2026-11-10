@@ -657,14 +657,18 @@ static void read_controller_state(struct xinput_controller *controller)
         {
         case 1: state.Gamepad.wButtons |= XINPUT_GAMEPAD_A; break;
         case 2: state.Gamepad.wButtons |= XINPUT_GAMEPAD_B; break;
-        case 3: state.Gamepad.wButtons |= XINPUT_GAMEPAD_X; break;
-        case 4: state.Gamepad.wButtons |= XINPUT_GAMEPAD_Y; break;
-        case 5: state.Gamepad.wButtons |= controller->hid.xbox_bt_quirks ? XINPUT_GAMEPAD_BACK : XINPUT_GAMEPAD_LEFT_SHOULDER; break;
-        case 6: state.Gamepad.wButtons |= controller->hid.xbox_bt_quirks ? XINPUT_GAMEPAD_START : XINPUT_GAMEPAD_RIGHT_SHOULDER; break;
+        case 3: if (!controller->hid.xbox_bt_quirks) state.Gamepad.wButtons |= XINPUT_GAMEPAD_X; break;
+        case 4: state.Gamepad.wButtons |= controller->hid.xbox_bt_quirks ? XINPUT_GAMEPAD_X : XINPUT_GAMEPAD_Y; break;
+        case 5: state.Gamepad.wButtons |= controller->hid.xbox_bt_quirks ? XINPUT_GAMEPAD_Y : XINPUT_GAMEPAD_LEFT_SHOULDER; break;
+        case 6: if (!controller->hid.xbox_bt_quirks) state.Gamepad.wButtons |= XINPUT_GAMEPAD_RIGHT_SHOULDER; break;
         case 7: state.Gamepad.wButtons |= controller->hid.xbox_bt_quirks ? XINPUT_GAMEPAD_LEFT_SHOULDER : XINPUT_GAMEPAD_BACK; break;
         case 8: state.Gamepad.wButtons |= controller->hid.xbox_bt_quirks ? XINPUT_GAMEPAD_RIGHT_SHOULDER : XINPUT_GAMEPAD_START; break;
-        case 9: state.Gamepad.wButtons |= XINPUT_GAMEPAD_LEFT_THUMB; break;
-        case 10: state.Gamepad.wButtons |= XINPUT_GAMEPAD_RIGHT_THUMB; break;
+        case 9: if (!controller->hid.xbox_bt_quirks) state.Gamepad.wButtons |= XINPUT_GAMEPAD_LEFT_THUMB; break;
+        case 10: if (!controller->hid.xbox_bt_quirks) state.Gamepad.wButtons |= XINPUT_GAMEPAD_RIGHT_THUMB; break;
+        case 11: if (controller->hid.xbox_bt_quirks) state.Gamepad.wButtons |= XINPUT_GAMEPAD_BACK; break;
+        case 12: if (controller->hid.xbox_bt_quirks) state.Gamepad.wButtons |= XINPUT_GAMEPAD_START; break;
+        case 14: if (controller->hid.xbox_bt_quirks) state.Gamepad.wButtons |= XINPUT_GAMEPAD_LEFT_THUMB; break;
+        case 15: if (controller->hid.xbox_bt_quirks) state.Gamepad.wButtons |= XINPUT_GAMEPAD_RIGHT_THUMB; break;
         }
     }
 
@@ -697,8 +701,14 @@ static void read_controller_state(struct xinput_controller *controller)
 
     status = HidP_GetUsageValue(HidP_Input, HID_USAGE_PAGE_GENERIC, 0, HID_USAGE_GENERIC_Y, &value, controller->hid.preparsed, report_buf, report_len);
     if (status != HIDP_STATUS_SUCCESS) WARN("HidP_GetUsageValue HID_USAGE_PAGE_GENERIC / HID_USAGE_GENERIC_Y returned %#lx\n", status);
-    else state.Gamepad.sThumbLY = (controller->hid.xbox_bt_quirks ? -1 : 1)
-                                            * scale_value(value, &controller->hid.ly_caps, -32768, 32767);
+    else
+    {
+        LONG ly = scale_value(value, &controller->hid.ly_caps, -32768, 32767);
+        if (controller->hid.xbox_bt_quirks) ly = -ly;
+        if (ly > 32767) ly = 32767;
+        if (ly < -32768) ly = -32768;
+        state.Gamepad.sThumbLY = ly;
+    }
 
     if (controller->hid.xbox_bt_quirks)
     {
@@ -709,7 +719,12 @@ static void read_controller_state(struct xinput_controller *controller)
 
         status = HidP_GetUsageValue(HidP_Input, HID_USAGE_PAGE_GENERIC, 0, HID_USAGE_GENERIC_RZ, &value, controller->hid.preparsed, report_buf, report_len);
         if (status != HIDP_STATUS_SUCCESS) WARN("HidP_GetUsageValue HID_USAGE_PAGE_GENERIC / HID_USAGE_GENERIC_RZ returned %#lx\n", status);
-        else state.Gamepad.sThumbRY = -scale_value(value, &controller->hid.rt_caps, -32768, 32767);
+        else
+        {
+            LONG ry = -scale_value(value, &controller->hid.rt_caps, -32768, 32767);
+            if (ry > 32767) ry = 32767;
+            state.Gamepad.sThumbRY = ry;
+        }
 
         status = HidP_GetUsageValue(HidP_Input, HID_USAGE_PAGE_SIMULATION, 0, HID_USAGE_SIMULATION_BRAKE, &value, controller->hid.preparsed, report_buf, report_len);
         if (status != HIDP_STATUS_SUCCESS) WARN("HidP_GetUsageValue brake returned %#lx\n", status);
