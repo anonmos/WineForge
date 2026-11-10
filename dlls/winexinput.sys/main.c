@@ -760,12 +760,6 @@ static NTSTATUS initialize_device(DEVICE_OBJECT *device)
     }
     free(value_caps);
     if (status != HIDP_STATUS_SUCCESS) return status;
-    /* Xbox Bluetooth pads (e.g. 045E:0B13) send Y up-positive and expose the
-     * right stick as 16-bit Z/Rz with triggers on sim brake/accel. */
-    fdo->xbox_bt_quirks = (wcsstr(fdo->base.device_id, L"BTHENUM") &&
-                           wcsstr(fdo->base.device_id, L"VID_045E")) ? TRUE : FALSE;
-    if (fdo->xbox_bt_quirks) TRACE("Xbox Bluetooth quirks enabled for %s\n",
-                                   debugstr_w(fdo->base.device_id));
     if (!fdo->lx_caps.UsagePage) WARN("missing lx axis\n");
     if (!fdo->ly_caps.UsagePage) WARN("missing ly axis\n");
     if (!fdo->lt_caps.UsagePage) WARN("missing lt axis\n");
@@ -942,6 +936,12 @@ static NTSTATUS WINAPI add_device(DRIVER_OBJECT *driver, DEVICE_OBJECT *bus_devi
     fdo = device->DeviceExtension;
     fdo->base.is_fdo = TRUE;
     swprintf(fdo->base.device_id, MAX_DEVICE_ID_LEN, L"WINEXINPUT\\%s", device_id);
+    /* Xbox Bluetooth pads send Y up-positive and expose the right stick as
+     * 16-bit Z/Rz with triggers on sim brake/accel; bus_id still holds the
+     * bus prefix here (device_id was split off it above). */
+    fdo->xbox_bt_quirks = !wcscmp(bus_id, L"BTHENUM") && !!wcsstr(device_id, L"VID_045E");
+    if (fdo->xbox_bt_quirks) TRACE("Xbox Bluetooth quirks enabled for %s.\n",
+                                   debugstr_w(fdo->base.device_id));
 
     fdo->bus_device = bus_device;
     wcscpy(fdo->instance_id, instance_id);
