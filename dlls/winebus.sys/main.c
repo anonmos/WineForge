@@ -577,6 +577,12 @@ static BOOL is_hidraw_enabled(WORD vid, WORD pid, const USAGE_AND_PAGE *usages, 
         if (pid == 0x2007) prefer_hidraw = TRUE; /* Joy-Con R */
         if (pid == 0x2009) prefer_hidraw = TRUE; /* Pro Controller */
         break;
+    case 0x045e:
+        /* All Microsoft Xbox controllers: on macOS the IOHID backend marks
+         * every device hidraw, so without this they are dropped entirely and
+         * never surface as DirectInput/XInput gamepads. */
+        prefer_hidraw = TRUE;
+        break;
     }
 
     RtlInitUnicodeString(&str, L"EnableHidraw");
