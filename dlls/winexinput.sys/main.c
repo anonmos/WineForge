@@ -738,6 +738,15 @@ static NTSTATUS initialize_device(DEVICE_OBJECT *device)
     if (status != HIDP_STATUS_SUCCESS) return status;
     if (button_count < 10) WARN("only %u buttons found\n", button_count);
 
+    memset(&fdo->lx_caps, 0, sizeof(HIDP_VALUE_CAPS));
+    memset(&fdo->ly_caps, 0, sizeof(HIDP_VALUE_CAPS));
+    memset(&fdo->lt_caps, 0, sizeof(HIDP_VALUE_CAPS));
+    memset(&fdo->rx_caps, 0, sizeof(HIDP_VALUE_CAPS));
+    memset(&fdo->ry_caps, 0, sizeof(HIDP_VALUE_CAPS));
+    memset(&fdo->rt_caps, 0, sizeof(HIDP_VALUE_CAPS));
+    memset(&fdo->brake_caps, 0, sizeof(HIDP_VALUE_CAPS));
+    memset(&fdo->accel_caps, 0, sizeof(HIDP_VALUE_CAPS));
+    fdo->xbox_bt_quirks = FALSE;
     if (!(value_caps = malloc(sizeof(*value_caps) * caps.NumberInputValueCaps))) return STATUS_NO_MEMORY;
     status = HidP_GetValueCaps(HidP_Input, value_caps, &caps.NumberInputValueCaps, preparsed);
     if (status != HIDP_STATUS_SUCCESS) WARN("HidP_GetValueCaps returned %#lx\n", status);
