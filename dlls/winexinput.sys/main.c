@@ -33,6 +33,7 @@
 #include "ddk/hidport.h"
 #include "ddk/hidpddi.h"
 #include "ddk/hidtypes.h"
+#include "hidusage.h"
 
 #include "wine/asm.h"
 #include "wine/debug.h"
@@ -158,6 +159,9 @@ struct func_device
     HIDP_VALUE_CAPS rx_caps;
     HIDP_VALUE_CAPS ry_caps;
     HIDP_VALUE_CAPS rt_caps;
+    HIDP_VALUE_CAPS brake_caps;
+    HIDP_VALUE_CAPS accel_caps;
+    BOOL xbox_bt_quirks;
     HIDP_DEVICE_DESC device_desc;
 
     /* everything below requires holding the cs */
@@ -195,7 +199,7 @@ static void translate_report_to_xinput_state(struct func_device *fdo)
 {
     ULONG lx = 0, ly = 0, rx = 0, ry = 0, lt = 0, rt = 0, hat = 0;
     PHIDP_PREPARSED_DATA preparsed;
-    USAGE usages[10];
+    USAGE usages[16];
     NTSTATUS status;
     ULONG i, count;
 
@@ -229,17 +233,62 @@ static void translate_report_to_xinput_state(struct func_device *fdo)
 
     if (hat < 1 || hat > 8) fdo->xinput_state.buttons = 0;
     else fdo->xinput_state.buttons = hat << 10;
-    for (i = 0; i < count; i++)
+    if (fdo->xbox_bt_quirks)
+    {
+        /* Xbox button usage order -> XInput bits (SDL 15-button map) */
+        static const WORD xbox_buttons[] = {12,13,0,14,15,0,8,9,0,0,5,4,0,6,7,0};
+        for (i = 0; i < count && i < 16; i++)
+        {
+            WORD bit;
+            if (usages[i] < 1 || usages[i] > 16) continue;
+            bit = xbox_buttons[usages[i] - 1];
+            if (bit) fdo->xinput_state.buttons |= (1 << bit);
+        }
+    }
+    else for (i = 0; i < count; i++)
     {
         if (usages[i] < 1 || usages[i] > 10) continue;
         fdo->xinput_state.buttons |= (1 << (usages[i] - 1));
     }
-    fdo->xinput_state.lx_axis = scale_value(lx, &fdo->lx_caps, 0, 65535);
-    fdo->xinput_state.ly_axis = 65535 - scale_value(ly, &fdo->ly_caps, 0, 65535);
-    fdo->xinput_state.rx_axis = scale_value(rx, &fdo->rx_caps, 0, 65535);
-    fdo->xinput_state.ry_axis = 65535 - scale_value(ry, &fdo->ry_caps, 0, 65535);
-    rt = scale_value(rt, &fdo->rt_caps, 0, 255);
-    lt = scale_value(lt, &fdo->lt_caps, 0, 255);
+    if (fdo->xbox_bt_quirks)
+    {
+        ULONG brake = 0, accel = 0;
+        if (fdo->brake_caps.BitSize)
+        {
+            status = HidP_GetUsageValue(HidP_Input, HID_USAGE_PAGE_SIMULATION, 0,
+                                        HID_USAGE_SIMULATION_BRAKE, &brake, preparsed,
+                                        fdo->report_buf, fdo->report_len);
+            if (status != HIDP_STATUS_SUCCESS) brake = 0;
+        }
+        if (fdo->accel_caps.BitSize)
+        {
+            status = HidP_GetUsageValue(HidP_Input, HID_USAGE_PAGE_SIMULATION, 0,
+                                        HID_USAGE_SIMULATION_ACCELERATOR, &accel, preparsed,
+                                        fdo->report_buf, fdo->report_len);
+            if (status != HIDP_STATUS_SUCCESS) accel = 0;
+        }
+        fdo->xinput_state.lx_axis = scale_value(lx, &fdo->lx_caps, 0, 65535);
+        fdo->xinput_state.ly_axis = scale_value(ly, &fdo->ly_caps, 0, 65535);
+        if (fdo->rx_caps.BitSize)
+            fdo->xinput_state.rx_axis = scale_value(rx, &fdo->rx_caps, 0, 65535);
+        else /* 16-bit Z doubles as right-X */
+            fdo->xinput_state.rx_axis = scale_value(lt, &fdo->lt_caps, 0, 65535);
+        if (fdo->ry_caps.BitSize)
+            fdo->xinput_state.ry_axis = scale_value(ry, &fdo->ry_caps, 0, 65535);
+        else /* 16-bit Rz doubles as right-Y */
+            fdo->xinput_state.ry_axis = scale_value(rt, &fdo->rt_caps, 0, 65535);
+        lt = fdo->brake_caps.BitSize ? scale_value(brake, &fdo->brake_caps, 0, 255) : 0;
+        rt = fdo->accel_caps.BitSize ? scale_value(accel, &fdo->accel_caps, 0, 255) : 0;
+    }
+    else
+    {
+        fdo->xinput_state.lx_axis = scale_value(lx, &fdo->lx_caps, 0, 65535);
+        fdo->xinput_state.ly_axis = 65535 - scale_value(ly, &fdo->ly_caps, 0, 65535);
+        fdo->xinput_state.rx_axis = scale_value(rx, &fdo->rx_caps, 0, 65535);
+        fdo->xinput_state.ry_axis = 65535 - scale_value(ry, &fdo->ry_caps, 0, 65535);
+        rt = scale_value(rt, &fdo->rt_caps, 0, 255);
+        lt = scale_value(lt, &fdo->lt_caps, 0, 255);
+    }
     fdo->xinput_state.trigger = 0x8000 + (lt - rt) * 128;
 }
 
@@ -642,6 +691,8 @@ static void check_value_caps(struct func_device *fdo, USHORT usage, HIDP_VALUE_C
     case HID_USAGE_GENERIC_RX: fdo->rx_caps = *caps; break;
     case HID_USAGE_GENERIC_RY: fdo->ry_caps = *caps; break;
     case HID_USAGE_GENERIC_RZ: fdo->rt_caps = *caps; break;
+    case HID_USAGE_SIMULATION_BRAKE: fdo->brake_caps = *caps; break;
+    case HID_USAGE_SIMULATION_ACCELERATOR: fdo->accel_caps = *caps; break;
     }
 }
 
@@ -693,12 +744,19 @@ static NTSTATUS initialize_device(DEVICE_OBJECT *device)
     else for (i = 0; i < caps.NumberInputValueCaps; i++)
     {
         HIDP_VALUE_CAPS *caps = value_caps + i;
-        if (caps->UsagePage != HID_USAGE_PAGE_GENERIC) continue;
+        if (caps->UsagePage != HID_USAGE_PAGE_GENERIC &&
+            caps->UsagePage != HID_USAGE_PAGE_SIMULATION) continue;
         if (!caps->IsRange) check_value_caps(fdo, caps->NotRange.Usage, caps);
         else for (u = caps->Range.UsageMin; u <=caps->Range.UsageMax; u++) check_value_caps(fdo, u, value_caps + i);
     }
     free(value_caps);
     if (status != HIDP_STATUS_SUCCESS) return status;
+    /* Xbox Bluetooth pads (e.g. 045E:0B13) send Y up-positive and expose the
+     * right stick as 16-bit Z/Rz with triggers on sim brake/accel. */
+    fdo->xbox_bt_quirks = (wcsstr(fdo->base.device_id, L"BTHENUM") &&
+                           wcsstr(fdo->base.device_id, L"VID_045E")) ? TRUE : FALSE;
+    if (fdo->xbox_bt_quirks) TRACE("Xbox Bluetooth quirks enabled for %s\n",
+                                   debugstr_w(fdo->base.device_id));
     if (!fdo->lx_caps.UsagePage) WARN("missing lx axis\n");
     if (!fdo->ly_caps.UsagePage) WARN("missing ly axis\n");
     if (!fdo->lt_caps.UsagePage) WARN("missing lt axis\n");

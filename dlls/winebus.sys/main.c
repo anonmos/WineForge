@@ -82,6 +82,7 @@ enum device_state
 
 #define HIDRAW_FIXUP_DUALSHOCK_BT 0x1
 #define HIDRAW_FIXUP_DUALSENSE_BT 0x2
+#define HIDRAW_FIXUP_XBOX_BT 0x4
 
 struct device_extension
 {
@@ -401,6 +402,11 @@ static DEVICE_OBJECT *bus_create_hid_device(struct device_desc *desc, UINT64 uni
     {
         TRACE("Enabling report fixup for Bluetooth DualSense device %p\n", device);
         ext->report_fixups |= HIDRAW_FIXUP_DUALSENSE_BT;
+    }
+    if (desc->is_hidraw && (desc->bus_type == BUS_TYPE_BLUETOOTH) && desc->vid == 0x045e)
+    {
+        TRACE("Enabling report fixup for Bluetooth Xbox device %p\n", device);
+        ext->report_fixups |= HIDRAW_FIXUP_XBOX_BT;
     }
 
     InitializeCriticalSectionEx(&ext->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
@@ -728,6 +734,20 @@ static void process_hid_report(DEVICE_OBJECT *device, BYTE *report_buf, DWORD re
             report->buffer[7] = report->buffer[10]; /* Buttons[2] */
             report->buffer[8] = trigger[0]; /* TriggerLeft */
             report->buffer[9] = trigger[1]; /* TirggerRight */
+        }
+    }
+
+    if (ext->report_fixups & HIDRAW_FIXUP_XBOX_BT)
+    {
+        /* Xbox One/Series Bluetooth firmware sends LB/RB on bits the report
+         * descriptor declares as padding (byte 13, bits 6-7 of the 17-byte
+         * report 1). Relocate them onto the declared button usages 7/8
+         * (byte 14, bits 6-7) so classic mapping sees them. */
+        if (report->length >= 15 && report->buffer[0] == 1)
+        {
+            if (report->buffer[13] & 0x40) report->buffer[14] |= 0x40;
+            if (report->buffer[13] & 0x80) report->buffer[14] |= 0x80;
+            report->buffer[13] &= ~0xc0;
         }
     }
 
