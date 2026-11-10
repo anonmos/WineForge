@@ -936,10 +936,11 @@ static NTSTATUS WINAPI add_device(DRIVER_OBJECT *driver, DEVICE_OBJECT *bus_devi
     fdo = device->DeviceExtension;
     fdo->base.is_fdo = TRUE;
     swprintf(fdo->base.device_id, MAX_DEVICE_ID_LEN, L"WINEXINPUT\\%s", device_id);
-    /* Xbox Bluetooth pads send Y up-positive and expose the right stick as
-     * 16-bit Z/Rz with triggers on sim brake/accel; bus_id still holds the
-     * bus prefix here (device_id was split off it above). */
-    fdo->xbox_bt_quirks = !wcscmp(bus_id, L"BTHENUM") && !!wcsstr(device_id, L"VID_045E");
+    /* Xbox Bluetooth pads (045E:0B13, the BLE Xbox One S / Series pad)
+     * send Y up-positive and expose the right stick as 16-bit Z/Rz with
+     * triggers on sim brake/accel. NOTE: bus_id here is always the generic
+     * "WINEBUS" parent id, so match VID:PID directly. */
+    fdo->xbox_bt_quirks = !!wcsstr(device_id, L"VID_045E&PID_0B13");
     if (fdo->xbox_bt_quirks) TRACE("Xbox Bluetooth quirks enabled for %s.\n",
                                    debugstr_w(fdo->base.device_id));
 
