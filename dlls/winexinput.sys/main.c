@@ -235,14 +235,16 @@ static void translate_report_to_xinput_state(struct func_device *fdo)
     else fdo->xinput_state.buttons = hat << 10;
     if (fdo->xbox_bt_quirks)
     {
-        /* Xbox button usage order -> XInput bits (SDL 15-button map) */
-        static const WORD xbox_buttons[] = {12,13,0,14,15,0,8,9,0,0,5,4,0,6,7,0};
+        /* Xbox BT firmware button order -> synthetic usage positions 1-10
+         * (ground truth: raw captures show LB=U7 RB=U8, so Back/Start sit
+         * at U5/U6; xinput1_3 expects LB/RB at 5/6, Back/Start at 7/8). */
+        static const BYTE xbox_btn_map[] = {1,2,3,4,7,8,5,6,9,10};
         for (i = 0; i < count && i < 16; i++)
         {
-            WORD bit;
-            if (usages[i] < 1 || usages[i] > 16) continue;
-            bit = xbox_buttons[usages[i] - 1];
-            if (bit) fdo->xinput_state.buttons |= (1 << bit);
+            BYTE syn;
+            if (usages[i] < 1 || usages[i] > 10) continue;
+            syn = xbox_btn_map[usages[i] - 1];
+            fdo->xinput_state.buttons |= (1 << (syn - 1));
         }
     }
     else for (i = 0; i < count; i++)
@@ -268,7 +270,7 @@ static void translate_report_to_xinput_state(struct func_device *fdo)
             if (status != HIDP_STATUS_SUCCESS) accel = 0;
         }
         fdo->xinput_state.lx_axis = scale_value(lx, &fdo->lx_caps, 0, 65535);
-        fdo->xinput_state.ly_axis = scale_value(ly, &fdo->ly_caps, 0, 65535);
+        fdo->xinput_state.ly_axis = 65535 - scale_value(ly, &fdo->ly_caps, 0, 65535);
         if (fdo->rx_caps.BitSize)
             fdo->xinput_state.rx_axis = scale_value(rx, &fdo->rx_caps, 0, 65535);
         else /* 16-bit Z doubles as right-X */
